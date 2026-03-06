@@ -21,7 +21,7 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # -------- 配置变量（可修改）--------
-SCRIPT_VERSION="1.0.5"
+SCRIPT_VERSION="1.0.6"
 VAULT_VERSION=""  # 留空则自动获取最新版本，或手动指定如 "1.17.2"
 VAULT_PORT="8200"
 VAULT_DATA_DIR="/opt/vault/data"
@@ -763,6 +763,36 @@ setup_cors() {
   echo ""
 }
 
+setup_global_audit() {
+  export VAULT_ADDR="http://127.0.0.1:$VAULT_PORT"
+
+  info "配置全局审计日志..."
+  auto_login_vault
+
+  echo ""
+  read -p "请输入审计日志文件路径 (默认: /var/log/vault/audit.log): " AUDIT_FILE
+  AUDIT_FILE=${AUDIT_FILE:-/var/log/vault/audit.log}
+  AUDIT_DIR=$(dirname "$AUDIT_FILE")
+
+  mkdir -p "$AUDIT_DIR" || error "无法创建审计目录: $AUDIT_DIR"
+  touch "$AUDIT_FILE" || error "无法创建审计文件: $AUDIT_FILE"
+  chown "$VAULT_USER:$VAULT_USER" "$AUDIT_DIR" "$AUDIT_FILE" || error "无法设置审计文件权限"
+  chmod 750 "$AUDIT_DIR" || warn "设置目录权限失败: $AUDIT_DIR"
+  chmod 640 "$AUDIT_FILE" || warn "设置文件权限失败: $AUDIT_FILE"
+
+  if vault audit list 2>/dev/null | grep -q '^file/'; then
+    info "检测到已存在 file/ 审计设备，先执行重建..."
+    vault audit disable file > /dev/null 2>&1 || warn "禁用旧 file/ 审计失败，继续尝试启用新配置"
+  fi
+
+  vault audit enable file file_path="$AUDIT_FILE" || error "启用全局审计失败，请检查路径权限: $AUDIT_FILE"
+  success "全局审计已启用: $AUDIT_FILE"
+  echo ""
+  info "当前审计设备："
+  vault audit list || warn "读取审计设备列表失败"
+  echo ""
+}
+
 get_nginx_bin() {
   if [ -x "/www/server/nginx/sbin/nginx" ]; then
     echo "/www/server/nginx/sbin/nginx"
@@ -988,6 +1018,7 @@ show_menu() {
   echo -e "  ${BLUE}[5]${NC} 配置 CORS 跨域支持"
   echo -e "  ${BLUE}[6]${NC} 查看 Vault 状态"
   echo -e "  ${BLUE}[7]${NC} 生成中文管理面板"
+  echo -e "  ${BLUE}[8]${NC} 开启全局审计日志"
   echo -e "  ${BLUE}[0]${NC} 退出"
   echo ""
 }
@@ -1076,7 +1107,7 @@ menu_unseal() {
 main() {
   while true; do
     show_menu
-    read -p "请选择操作 [0-7]: " MENU_CHOICE
+    read -p "请选择操作 [0-8]: " MENU_CHOICE
     
     case $MENU_CHOICE in
       1)
@@ -1103,6 +1134,10 @@ main() {
         ;;
       7)
         deploy_cn_admin_panel
+        ;;
+      8)
+        check_root
+        setup_global_audit
         ;;
       0)
         echo ""
