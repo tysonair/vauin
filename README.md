@@ -32,7 +32,6 @@
 bash <(curl -sL https://raw.githubusercontent.com/tysonair/vauin/main/vauin.sh)
 ```
 
-> **注意**：请确保你的 GitHub 仓库中文件名为 `vault-install.sh`，如果你的文件名为 `vauin.sh`，请相应修改上述命令的最后一部分。
 
 ### 脚本菜单
 
