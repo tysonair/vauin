@@ -21,12 +21,15 @@ warn()    { echo -e "${YELLOW}[WARN]${NC} $1"; }
 error()   { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 
 # -------- 配置变量（可修改）--------
+SCRIPT_VERSION="1.0.5"
 VAULT_VERSION=""  # 留空则自动获取最新版本，或手动指定如 "1.17.2"
 VAULT_PORT="8200"
 VAULT_DATA_DIR="/opt/vault/data"
 VAULT_CONFIG_DIR="/etc/vault"
 VAULT_BIN="/usr/local/bin/vault"
 VAULT_USER="vault"
+ADMIN_PANEL_RAW_URL="https://raw.githubusercontent.com/tysonair/vauin/main/admin.html"
+ADMIN_PANEL_ROUTE_MARKER="# VAUIN_ADMIN_PANEL_ROUTE"
 
 # -------- 检查 root --------
 check_root() {
@@ -760,6 +763,182 @@ setup_cors() {
   echo ""
 }
 
+get_nginx_bin() {
+  if [ -x "/www/server/nginx/sbin/nginx" ]; then
+    echo "/www/server/nginx/sbin/nginx"
+    return
+  fi
+  if command -v nginx >/dev/null 2>&1; then
+    command -v nginx
+    return
+  fi
+  echo ""
+}
+
+validate_nginx_conf() {
+  NGINX_BIN="$1"
+  if [ "$NGINX_BIN" = "/www/server/nginx/sbin/nginx" ] && [ -f "/www/server/nginx/conf/nginx.conf" ]; then
+    "$NGINX_BIN" -t -c /www/server/nginx/conf/nginx.conf > /dev/null 2>&1
+  else
+    "$NGINX_BIN" -t > /dev/null 2>&1
+  fi
+}
+
+reload_nginx_service() {
+  NGINX_BIN="$1"
+  if pgrep -x nginx >/dev/null 2>&1; then
+    "$NGINX_BIN" -s reload > /dev/null 2>&1 || true
+  else
+    if [ -x "/etc/init.d/nginx" ]; then
+      /etc/init.d/nginx start > /dev/null 2>&1 || true
+    elif command -v systemctl >/dev/null 2>&1; then
+      systemctl start nginx > /dev/null 2>&1 || true
+    fi
+    "$NGINX_BIN" -s reload > /dev/null 2>&1 || true
+  fi
+  pgrep -x nginx >/dev/null 2>&1
+}
+
+setup_admin_panel_nginx_route() {
+  WEB_ROOT="$1"
+  DOMAIN_GUESS=$(basename "$WEB_ROOT")
+
+  CONF_CANDIDATES=(
+    "/www/server/panel/vhost/nginx/${DOMAIN_GUESS}.conf"
+    "/etc/nginx/conf.d/${DOMAIN_GUESS}.conf"
+    "/etc/nginx/sites-enabled/${DOMAIN_GUESS}"
+    "/etc/nginx/sites-available/${DOMAIN_GUESS}"
+  )
+
+  NGINX_CONF=""
+  for conf in "${CONF_CANDIDATES[@]}"; do
+    if [ -f "$conf" ]; then
+      NGINX_CONF="$conf"
+      break
+    fi
+  done
+
+  if [ -z "$NGINX_CONF" ]; then
+    warn "未自动找到 Nginx 站点配置，请手动添加 admin.html 路由优先级"
+    return
+  fi
+
+  TMP_CONF="$(mktemp)"
+  if ! awk -v marker="$ADMIN_PANEL_ROUTE_MARKER" -v panel_file="$WEB_ROOT/admin.html" '
+    BEGIN { in_managed=0; pending_server=0; inserted=0 }
+    {
+      if ($0 ~ marker) { in_managed=1; next }
+      if (in_managed == 1) {
+        if ($0 ~ /^[[:space:]]*}[[:space:]]*$/) { in_managed=0 }
+        next
+      }
+      print $0
+      if ($0 ~ /^[[:space:]]*server[[:space:]]*\{?[[:space:]]*$/) {
+        if ($0 ~ /^[[:space:]]*server[[:space:]]*$/) {
+          pending_server=1
+          next
+        }
+        print "    " marker
+        print "    location = /admin.html {"
+        print "        alias " panel_file ";"
+        print "        default_type text/html;"
+        print "        add_header Cache-Control \"no-cache\";"
+        print "        add_header Pragma \"no-cache\";"
+        print "        add_header Expires \"0\";"
+        print "    }"
+        inserted=1
+        pending_server=0
+        next
+      }
+      if (pending_server == 1 && $0 ~ /^[[:space:]]*\{[[:space:]]*$/) {
+        print "    " marker
+        print "    location = /admin.html {"
+        print "        alias " panel_file ";"
+        print "        default_type text/html;"
+        print "        add_header Cache-Control \"no-cache\";"
+        print "        add_header Pragma \"no-cache\";"
+        print "        add_header Expires \"0\";"
+        print "    }"
+        inserted=1
+        pending_server=0
+        next
+      }
+      pending_server=0
+    }
+    END {
+      if (inserted == 0) exit 9
+    }
+  ' "$NGINX_CONF" > "$TMP_CONF"; then
+    rm -f "$TMP_CONF"
+    error "未在 $NGINX_CONF 找到可注入的 server 块，写入终止"
+  fi
+
+  mv "$TMP_CONF" "$NGINX_CONF" || error "写入 Nginx 配置失败: $NGINX_CONF"
+  if ! grep -q "$ADMIN_PANEL_ROUTE_MARKER" "$NGINX_CONF"; then
+    error "路由规则未写入成功: $NGINX_CONF"
+  fi
+
+  NGINX_BIN="$(get_nginx_bin)"
+  if [ -z "$NGINX_BIN" ]; then
+    warn "未找到 nginx 可执行文件，请手动校验并重载配置: $NGINX_CONF"
+    return
+  fi
+
+  if validate_nginx_conf "$NGINX_BIN"; then
+    if reload_nginx_service "$NGINX_BIN"; then
+      success "已写入并生效 Nginx admin.html 路由: $NGINX_CONF"
+    else
+      warn "Nginx 未成功运行，请手动启动并重载后再访问 admin.html"
+    fi
+  else
+    warn "Nginx 配置校验失败，已保留变更，请手动检查: $NGINX_CONF"
+  fi
+}
+
+deploy_cn_admin_panel() {
+  check_root
+
+  echo ""
+  info "生成中文管理面板"
+  echo ""
+  read -p "请输入站点根目录 (默认: /var/www/html): " WEB_ROOT
+  WEB_ROOT=${WEB_ROOT:-/var/www/html}
+  PANEL_FILE="$WEB_ROOT/admin.html"
+
+  mkdir -p "$WEB_ROOT" || error "无法创建目录: $WEB_ROOT"
+  if [ -f "$PANEL_FILE" ]; then
+    BACKUP_FILE="$PANEL_FILE.bak.$(date +%Y%m%d%H%M%S)"
+    cp -f "$PANEL_FILE" "$BACKUP_FILE" || error "备份旧文件失败: $PANEL_FILE"
+    info "已备份旧文件: $BACKUP_FILE"
+  fi
+
+  info "从 GitHub 下载 admin.html..."
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$ADMIN_PANEL_RAW_URL" -o "$PANEL_FILE" || error "下载失败: $ADMIN_PANEL_RAW_URL"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$ADMIN_PANEL_RAW_URL" -O "$PANEL_FILE" || error "下载失败: $ADMIN_PANEL_RAW_URL"
+  else
+    error "未安装 curl/wget，请先安装依赖后重试"
+  fi
+
+  chmod 644 "$PANEL_FILE" || warn "设置权限失败，请手动执行: chmod 644 $PANEL_FILE"
+
+  if grep -q "Vault 管理面板" "$PANEL_FILE"; then
+    success "中文管理面板部署成功"
+  else
+    warn "文件已下载，但内容校验未通过，请手动检查: $PANEL_FILE"
+  fi
+
+  setup_admin_panel_nginx_route "$WEB_ROOT"
+
+  echo ""
+  info "访问方式"
+  echo -e "  将网站根目录指向：${BLUE}$WEB_ROOT${NC}"
+  echo -e "  若站点做了反代，请确保 /admin.html 为静态规则优先"
+  echo -e "  浏览器访问：${BLUE}https://你的域名/admin.html${NC}"
+  echo ""
+}
+
 # -------- 查看 Vault 状态 --------
 show_status() {
   export VAULT_ADDR="http://127.0.0.1:$VAULT_PORT"
@@ -799,7 +978,7 @@ do_install() {
 show_menu() {
   echo ""
   echo -e "${GREEN}============================================${NC}"
-  echo -e "${GREEN}   HashiCorp Vault 管理工具${NC}"
+  echo -e "${GREEN}   HashiCorp Vault 管理工具 v${SCRIPT_VERSION}${NC}"
   echo -e "${GREEN}============================================${NC}"
   echo ""
   echo -e "  ${BLUE}[1]${NC} 安装 / 升级 Vault"
@@ -808,6 +987,7 @@ show_menu() {
   echo -e "  ${BLUE}[4]${NC} 添加管理员用户"
   echo -e "  ${BLUE}[5]${NC} 配置 CORS 跨域支持"
   echo -e "  ${BLUE}[6]${NC} 查看 Vault 状态"
+  echo -e "  ${BLUE}[7]${NC} 生成中文管理面板"
   echo -e "  ${BLUE}[0]${NC} 退出"
   echo ""
 }
@@ -896,7 +1076,7 @@ menu_unseal() {
 main() {
   while true; do
     show_menu
-    read -p "请选择操作 [0-6]: " MENU_CHOICE
+    read -p "请选择操作 [0-7]: " MENU_CHOICE
     
     case $MENU_CHOICE in
       1)
@@ -920,6 +1100,9 @@ main() {
         ;;
       6)
         show_status
+        ;;
+      7)
+        deploy_cn_admin_panel
         ;;
       0)
         echo ""
