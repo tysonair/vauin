@@ -324,7 +324,7 @@ tr:hover td{background:var(--bg-card-hover);color:var(--text)}
           <div class="logo-icon">🔐</div>
           <div>
             <div class="logo-text">Vault 面板</div>
-            <div class="logo-sub">管理控制台</div>
+            <div class="logo-sub">管理控制台 v1.0.7</div>
           </div>
         </div>
         <div class="vault-status" id="vault-status">
@@ -368,6 +368,9 @@ tr:hover td{background:var(--bg-card-hover);color:var(--text)}
         </div>
         <div class="nav-item" onclick="showPage('health')">
           <span class="nav-icon">💊</span> 系统健康
+        </div>
+        <div class="nav-item" onclick="showPage('auditlogs')">
+          <span class="nav-icon">🧾</span> 调用日志
         </div>
         <div class="nav-item" onclick="showPage('settings')">
           <span class="nav-icon">🔧</span> 连接设置
@@ -648,6 +651,59 @@ tr:hover td{background:var(--bg-card-hover);color:var(--text)}
           </div>
         </div>
 
+        <div class="page" id="page-auditlogs">
+          <div class="card">
+            <div class="card-header">
+              <div class="card-title">🛡️ 审计设备状态</div>
+              <button class="btn btn-ghost" style="font-size:12px;padding:5px 10px" onclick="loadAuditDevices()">刷新状态</button>
+            </div>
+            <div class="card-body" id="audit-devices-body">
+              <div class="loading-state"><div class="spinner"></div>加载中...</div>
+            </div>
+          </div>
+          <div class="card" style="margin-top:16px">
+            <div class="card-header">
+              <div class="card-title">🧾 当前会话调用日志</div>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
+                <select id="api-log-kind" onchange="renderApiCallLogs()" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-pill);padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+                  <option value="all" selected>全部调用</option>
+                  <option value="secrets">仅密钥调用</option>
+                  <option value="smtp">仅 smtp 相关</option>
+                  <option value="failed">仅失败请求</option>
+                  <option value="sys">仅系统接口</option>
+                </select>
+                <input id="api-log-filter" type="text" placeholder="按路径/错误过滤" oninput="renderApiCallLogs()" style="width:200px;background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-pill);padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+                <select id="api-log-limit" onchange="renderApiCallLogs()" style="background:var(--bg-input);border:1px solid var(--border);border-radius:var(--radius-pill);padding:8px 12px;color:var(--text);font-size:12px;outline:none">
+                  <option value="50">最近 50 条</option>
+                  <option value="100" selected>最近 100 条</option>
+                  <option value="200">最近 200 条</option>
+                  <option value="500">最近 500 条</option>
+                </select>
+                <button class="btn btn-ghost" style="font-size:12px;padding:5px 10px" onclick="renderApiCallLogs()">刷新列表</button>
+                <button class="btn btn-danger" style="font-size:12px;padding:5px 10px" onclick="clearApiCallLogs()">清空</button>
+              </div>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:0 20px 14px;flex-wrap:wrap">
+              <div id="api-log-stats" style="font-size:12px;color:var(--text3)">总调用 0 ｜ 密钥调用 0 ｜ 失败 0</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px" onclick="setApiQuickFilter('secrets')">仅密钥调用</button>
+                <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px" onclick="setApiQuickFilter('smtp','smtp')">smtp 标签</button>
+                <button class="btn btn-ghost" style="font-size:11px;padding:4px 10px" onclick="setApiQuickFilter('all')">重置筛选</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>时间</th><th>方法</th><th>路径</th><th>状态码</th><th>耗时</th><th>结果</th><th>错误</th></tr>
+                </thead>
+                <tbody id="api-call-logs-tbody">
+                  <tr><td colspan="7"><div class="empty-state"><p>暂无调用记录</p></div></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
         <!-- 连接设置 -->
         <div class="page" id="page-settings">
           <div class="card">
@@ -885,19 +941,46 @@ let currentSecretPath = '';
 let editingSecretPath = null;
 let editingPolicyName = null;
 let allSecrets = [];
+let apiCallLogs = [];
 
 // ─── API ───
 async function vaultAPI(method, path, body = null) {
+  const started = Date.now();
+  const logItem = { time: new Date(started).toLocaleString('zh-CN'), method, path, status: '-', duration: '-', result: '失败', error: '' };
+  let logged = false;
   const opts = {
     method,
     headers: { 'X-Vault-Token': VAULT_TOKEN, 'Content-Type': 'application/json' }
   };
   if (body) opts.body = JSON.stringify(body);
-  const resp = await fetch(VAULT_ADDR + path, opts);
-  if (resp.status === 204) return {};
-  const data = await resp.json();
-  if (!resp.ok) throw new Error(data.errors ? data.errors.join(', ') : `HTTP ${resp.status}`);
-  return data;
+  try {
+    const resp = await fetch(VAULT_ADDR + path, opts);
+    const raw = await resp.text();
+    let data = {};
+    if (raw) {
+      try { data = JSON.parse(raw); } catch(_) { data = {}; }
+    }
+    logItem.status = String(resp.status);
+    logItem.duration = `${Date.now() - started}ms`;
+    logItem.result = resp.ok ? '成功' : '失败';
+    if (!resp.ok) {
+      logItem.error = data.errors ? data.errors.join(', ') : `HTTP ${resp.status}`;
+      pushApiCallLog(logItem);
+      logged = true;
+      throw new Error(logItem.error);
+    }
+    pushApiCallLog(logItem);
+    logged = true;
+    if (resp.status === 204 || !raw) return {};
+    return data;
+  } catch (e) {
+    if (!logged) {
+      logItem.duration = `${Date.now() - started}ms`;
+      logItem.error = e.message || '请求失败';
+      pushApiCallLog(logItem);
+    }
+    throw e;
+  }
 }
 
 // ─── Toast ───
@@ -952,7 +1035,7 @@ document.getElementById('vault-token').addEventListener('keydown', e => { if(e.k
 const pageTitles = {
   dashboard: '仪表盘', secrets: '密钥管理', engines: '引擎管理',
   tokens: 'Token 管理', policies: '策略管理', health: '系统健康', settings: '连接设置',
-  auth: '认证方法', identity: '身份管理', tools: '实用工具'
+  auth: '认证方法', identity: '身份管理', tools: '实用工具', auditlogs: '调用日志'
 };
 function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -968,9 +1051,117 @@ function showPage(name) {
   const loaders = { 
     secrets: loadSecrets, engines: loadEngines, policies: loadPolicies, 
     health: loadHealth, dashboard: loadDashboard, auth: loadAuthMethods,
-    identity: loadIdentity, tokens: () => {}, tools: () => {}, settings: () => {} 
+    identity: loadIdentity, tokens: () => {}, tools: () => {}, settings: () => {}, auditlogs: loadAuditLogs
   };
   if (loaders[name]) loaders[name]();
+}
+
+function pushApiCallLog(item) {
+  apiCallLogs.unshift(item);
+  if (apiCallLogs.length > 500) apiCallLogs = apiCallLogs.slice(0, 500);
+  renderApiLogStats();
+  const page = document.getElementById('page-auditlogs');
+  if (page && page.classList.contains('active')) renderApiCallLogs();
+}
+
+function clearApiCallLogs() {
+  apiCallLogs = [];
+  renderApiLogStats();
+  renderApiCallLogs();
+  toast('调用日志已清空', 'success');
+}
+
+function isSecretApiPath(path) {
+  if (!path) return false;
+  if (/^\/v1\/secret\//.test(path)) return true;
+  if (/^\/v1\/[^/]+\/data\//.test(path)) return true;
+  if (/^\/v1\/[^/]+\/metadata\//.test(path)) return true;
+  return false;
+}
+
+function renderApiLogStats() {
+  const el = document.getElementById('api-log-stats');
+  if (!el) return;
+  const total = apiCallLogs.length;
+  const secretCount = apiCallLogs.filter(r => isSecretApiPath(r.path)).length;
+  const failedCount = apiCallLogs.filter(r => r.result !== '成功').length;
+  el.textContent = `总调用 ${total} ｜ 密钥调用 ${secretCount} ｜ 失败 ${failedCount}`;
+}
+
+function setApiQuickFilter(kind, keyword = '') {
+  const kindEl = document.getElementById('api-log-kind');
+  const keywordEl = document.getElementById('api-log-filter');
+  if (kindEl) kindEl.value = kind;
+  if (keywordEl) keywordEl.value = keyword;
+  renderApiCallLogs();
+}
+
+function renderApiCallLogs() {
+  const tbody = document.getElementById('api-call-logs-tbody');
+  if (!tbody) return;
+  const keyword = (document.getElementById('api-log-filter')?.value || '').trim().toLowerCase();
+  const kind = document.getElementById('api-log-kind')?.value || 'all';
+  const limit = parseInt(document.getElementById('api-log-limit')?.value || '100', 10);
+  renderApiLogStats();
+  const rows = apiCallLogs
+    .filter(r => {
+      if (kind === 'secrets' && !isSecretApiPath(r.path)) return false;
+      if (kind === 'smtp' && !`${r.path} ${r.error}`.toLowerCase().includes('smtp')) return false;
+      if (kind === 'failed' && r.result === '成功') return false;
+      if (kind === 'sys' && !r.path.startsWith('/v1/sys/')) return false;
+      if (keyword && !`${r.path} ${r.error}`.toLowerCase().includes(keyword)) return false;
+      return true;
+    })
+    .slice(0, limit);
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><p>未命中筛选条件，可尝试切换为“仅密钥调用”或“重置筛选”</p></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const methodClass = r.method === 'GET' ? 'tag-blue' : r.method === 'POST' ? 'tag-green' : r.method === 'PUT' ? 'tag-purple' : r.method === 'DELETE' ? 'tag-red' : 'tag-gray';
+    const resultClass = r.result === '成功' ? 'tag-green' : 'tag-red';
+    return `<tr>
+      <td class="td-mono">${r.time}</td>
+      <td><span class="tag ${methodClass}">${r.method}</span></td>
+      <td class="td-mono" title="${escapeHtml(r.path)}">${escapeHtml(r.path)}</td>
+      <td>${escapeHtml(r.status)}</td>
+      <td class="td-mono">${escapeHtml(r.duration)}</td>
+      <td><span class="tag ${resultClass}">${r.result}</span></td>
+      <td style="max-width:320px;white-space:normal;word-break:break-word;color:var(--text3)">${escapeHtml(r.error || '-')}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadAuditDevices() {
+  const el = document.getElementById('audit-devices-body');
+  if (!el) return;
+  el.innerHTML = '<div class="loading-state"><div class="spinner"></div>加载中...</div>';
+  try {
+    const r = await vaultAPI('GET', '/v1/sys/audit');
+    const devices = r.data || r;
+    const entries = Object.entries(devices);
+    if (!entries.length) {
+      el.innerHTML = `<div class="alert alert-warn"><span>⚠️</span><span>未启用审计设备。建议先在 Vault 中启用 file 或 syslog 审计。</span></div>`;
+      return;
+    }
+    el.innerHTML = `<div class="table-wrap"><table>
+      <thead><tr><th>路径</th><th>类型</th><th>描述</th><th>关键配置</th></tr></thead>
+      <tbody>${entries.map(([path, info]) => `
+        <tr>
+          <td class="td-mono">${escapeHtml(path)}</td>
+          <td><span class="tag tag-blue">${escapeHtml(info.type || '-')}</span></td>
+          <td style="color:var(--text3)">${escapeHtml(info.description || '-')}</td>
+          <td class="td-mono">${escapeHtml(info.options?.file_path || info.options?.facility || '-')}</td>
+        </tr>`).join('')}</tbody>
+    </table></div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="alert alert-error"><span>❌</span><span>无法读取审计设备：${escapeHtml(e.message)}。请确认 Token 具有 sys/audit 读取权限。</span></div>`;
+  }
+}
+
+async function loadAuditLogs() {
+  await loadAuditDevices();
+  renderApiCallLogs();
 }
 
 // ─── 仪表盘 ───
